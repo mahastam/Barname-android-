@@ -1,0 +1,334 @@
+name: Build APK
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Generate project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_0'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "SvtAv1Compressor"
+          include(":app")
+          EOF_0
+          cat > build.gradle.kts <<'EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_1
+          cat > gradle.properties <<'EOF_2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF_2
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.svtcompress"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.svtcompress"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += "arm64-v8a" }
+              }
+              // ffmpeg ships as libffmpeg.so and must be extracted to nativeLibraryDir to be executable
+              packaging { jniLibs { useLegacyPackaging = true } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+          }
+          EOF_3
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="SVT-AV1 Compressor"
+                  android:extractNativeLibs="true"
+                  android:theme="@style/Theme.AppCompat.DayNight.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_4
+          mkdir -p app/src/main/java/com/example/svtcompress
+          cat > app/src/main/java/com/example/svtcompress/MainActivity.kt <<'EOF_5'
+          package com.example.svtcompress
+
+          import android.content.ContentValues
+          import android.media.MediaMetadataRetriever
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.provider.OpenableColumns
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.*
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import java.io.File
+          import kotlin.concurrent.thread
+
+          class MainActivity : AppCompatActivity() {
+
+              private var inputFile: File? = null
+              private var inputName = "video"
+              private var process: Process? = null
+
+              private lateinit var info: TextView
+              private lateinit var status: TextView
+              private lateinit var bar: ProgressBar
+              private lateinit var presetSp: Spinner
+              private lateinit var resSp: Spinner
+              private lateinit var crfSeek: SeekBar
+              private lateinit var crfLabel: TextView
+              private lateinit var pickBtn: Button
+              private lateinit var startBtn: Button
+              private lateinit var cancelBtn: Button
+
+              private val presets = (4..13).map { it.toString() }
+              private val resolutions = listOf("Original" to 0, "1080p" to 1080, "720p" to 720, "480p" to 480)
+
+              private val picker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  if (uri != null) loadInput(uri)
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  buildUi()
+              }
+
+              private fun buildUi() {
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  fun label(t: String) = TextView(this).apply { text = t; setPadding(0, pad, 0, 0) }
+
+                  pickBtn = Button(this).apply { text = "Choose video"; setOnClickListener { picker.launch("video/*") } }
+                  info = TextView(this).apply { text = "No video selected" }
+
+                  presetSp = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, presets)
+                      setSelection(presets.indexOf("6"))
+                  }
+                  resSp = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, resolutions.map { it.first })
+                  }
+                  crfLabel = TextView(this)
+                  crfSeek = SeekBar(this).apply {
+                      max = 63 - 20
+                      progress = 35 - 20
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { crfLabel.text = "Quality (CRF): ${p + 20}  (higher = smaller file)" }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {}
+                      })
+                  }
+                  crfLabel.text = "Quality (CRF): 35  (higher = smaller file)"
+
+                  startBtn = Button(this).apply { text = "Compress (SVT-AV1)"; isEnabled = false; setOnClickListener { startEncode() } }
+                  cancelBtn = Button(this).apply { text = "Cancel"; visibility = View.GONE; setOnClickListener { process?.destroy() } }
+                  bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
+                  status = TextView(this).apply { gravity = Gravity.START }
+
+                  listOf(pickBtn, info, label("Speed preset (4 slow/better … 13 fast)"), presetSp,
+                      label("Resolution"), resSp, label(""), crfLabel, crfSeek, startBtn, cancelBtn, bar, status)
+                      .forEach { root.addView(it) }
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+
+              private fun loadInput(uri: Uri) {
+                  status.text = "Reading file…"
+                  thread {
+                      try {
+                          contentResolver.query(uri, null, null, null, null)?.use { c ->
+                              if (c.moveToFirst()) inputName = c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME))
+                          }
+                          val f = File(cacheDir, "input.tmp")
+                          contentResolver.openInputStream(uri)!!.use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+                          inputFile = f
+                          runOnUiThread {
+                              info.text = "$inputName\n${f.length() / 1024 / 1024} MB"
+                              status.text = ""
+                              startBtn.isEnabled = true
+                          }
+                      } catch (e: Exception) {
+                          runOnUiThread { status.text = "Error: ${e.message}" }
+                      }
+                  }
+              }
+
+              private fun durationMs(f: File): Long {
+                  val r = MediaMetadataRetriever()
+                  return try {
+                      r.setDataSource(f.absolutePath)
+                      r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong() ?: 0L
+                  } catch (e: Exception) { 0L } finally { r.release() }
+              }
+
+              private fun startEncode() {
+                  val input = inputFile ?: return
+                  val ffmpeg = File(applicationInfo.nativeLibraryDir, "libffmpeg.so")
+                  if (!ffmpeg.exists()) {
+                      status.text = "libffmpeg.so is missing. Run scripts/build_native.sh first."
+                      return
+                  }
+                  val out = File(cacheDir, "output.mp4").also { it.delete() }
+                  val preset = presets[presetSp.selectedItemPosition]
+                  val crf = crfSeek.progress + 20
+                  val height = resolutions[resSp.selectedItemPosition].second
+                  val total = durationMs(input)
+
+                  val cmd = mutableListOf(
+                      ffmpeg.absolutePath, "-y", "-hide_banner", "-nostdin",
+                      "-progress", "pipe:1", "-nostats",
+                      "-i", input.absolutePath,
+                      "-c:v", "libsvtav1", "-preset", preset, "-crf", crf.toString(),
+                      "-pix_fmt", "yuv420p", "-g", "240",
+                      "-svtav1-params", "tune=0"
+                  )
+                  if (height > 0) cmd += listOf("-vf", "scale=-2:'min($height,ih)'")
+                  cmd += listOf("-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out.absolutePath)
+
+                  startBtn.isEnabled = false; pickBtn.isEnabled = false
+                  cancelBtn.visibility = View.VISIBLE
+                  bar.progress = 0
+                  status.text = "Encoding…"
+
+                  thread {
+                      val err = StringBuilder()
+                      try {
+                          val p = ProcessBuilder(cmd).start()
+                          process = p
+                          thread { p.errorStream.bufferedReader().forEachLine { err.appendLine(it); if (err.length > 8000) err.delete(0, 4000) } }
+                          p.inputStream.bufferedReader().forEachLine { line ->
+                              if (line.startsWith("out_time_us=") || line.startsWith("out_time_ms=")) {
+                                  val us = line.substringAfter('=').toLongOrNull() ?: return@forEachLine
+                                  if (total > 0) {
+                                      val frac = (us / 1000.0 / total).coerceIn(0.0, 1.0)
+                                      runOnUiThread { bar.progress = (frac * 1000).toInt(); status.text = "Encoding… ${(frac * 100).toInt()}%" }
+                                  }
+                              }
+                          }
+                          val code = p.waitFor()
+                          if (code == 0 && out.exists() && out.length() > 0) {
+                              val name = inputName.substringBeforeLast('.') + "_av1.mp4"
+                              saveToGallery(out, name)
+                              runOnUiThread {
+                                  bar.progress = 1000
+                                  status.text = "Done: Movies/SVT-AV1/$name\n${input.length() / 1024 / 1024} MB → ${out.length() / 1024 / 1024} MB"
+                              }
+                          } else {
+                              runOnUiThread { status.text = "Failed (code $code)\n" + err.takeLast(600) }
+                          }
+                      } catch (e: Exception) {
+                          runOnUiThread { status.text = "Error: ${e.message}" }
+                      } finally {
+                          process = null
+                          runOnUiThread { startBtn.isEnabled = true; pickBtn.isEnabled = true; cancelBtn.visibility = View.GONE }
+                      }
+                  }
+              }
+
+              private fun saveToGallery(src: File, name: String) {
+                  val values = ContentValues().apply {
+                      put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                      put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                      put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/SVT-AV1")
+                  }
+                  val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return
+                  contentResolver.openOutputStream(uri)!!.use { o -> src.inputStream().use { it.copyTo(o) } }
+              }
+          }
+          EOF_5
+          mkdir -p scripts
+          cat > scripts/build_native.sh <<'EOF_6'
+          #!/usr/bin/env bash
+          # Cross-compiles SVT-AV1 (default v4.3.0) + FFmpeg (libsvtav1) for Android arm64
+          # and installs the ffmpeg binary as app/src/main/jniLibs/arm64-v8a/libffmpeg.so
+          # Needs: Linux x86_64, Android NDK (r26+), git, cmake, make, pkg-config, nasm not required for arm64.
+          set -euo pipefail
+
+          : "${ANDROID_NDK_HOME:?Set ANDROID_NDK_HOME to your NDK path}"
+          SVT_TAG="${SVT_TAG:-v4.3.0}"
+          FFMPEG_REF="${FFMPEG_REF:-master}"   # if a release rejects SVT-AV1 4.3, use master
+          API="${API:-24}"
+          ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+          WORK="$ROOT/build-native"
+          PREFIX="$WORK/prefix"
+          TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          mkdir -p "$WORK" "$PREFIX"
+          cd "$WORK"
+
+          echo "==> SVT-AV1 $SVT_TAG"
+          [ -d SVT-AV1 ] || git clone --depth 1 --branch "$SVT_TAG" https://gitlab.com/AOMediaCodec/SVT-AV1.git
+          cmake -S SVT-AV1 -B svt-build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM="android-$API" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=OFF -DBUILD_APPS=OFF -DBUILD_DEC=OFF -DBUILD_TESTING=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX"
+          cmake --build svt-build -j"$(nproc)"
+          cmake --install svt-build
+
+          echo "==> FFmpeg ($FFMPEG_REF)"
+          [ -d FFmpeg ] || git clone --depth 1 --branch "$FFMPEG_REF" https://github.com/FFmpeg/FFmpeg.git
+          cd FFmpeg
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$PKG_CONFIG_PATH"
+          ./configure \
+            --prefix="$PREFIX/ffmpeg" \
+            --enable-cross-compile --target-os=android --arch=aarch64 --cpu=armv8-a \
+            --cc="$TC/bin/aarch64-linux-android${API}-clang" \
+            --cxx="$TC/bin/aarch64-linux-android${API}-clang++" \
+            --ar="$TC/bin/llvm-ar" --nm="$TC/bin/llvm-nm" \
+            --ranlib="$TC/bin/llvm-ranlib" --strip="$TC/bin/llvm-strip" \
+            --pkg-config=pkg-config --pkg-config-flags=--static \
+            --enable-libsvtav1 \
+            --disable-shared --enable-static --enable-pic \
+            --disable-doc --disable-ffplay --disable-ffprobe --disable-debug \
+            --extra-cflags="-O3" --extra-ldflags="-static-libstdc++"
+          make -j"$(nproc)"
+
+          OUT="$ROOT/app/src/main/jniLibs/arm64-v8a/libffmpeg.so"
+          mkdir -p "$(dirname "$OUT")"
+          cp ffmpeg "$OUT"
+          "$TC/bin/llvm-strip" "$OUT"
+          echo "==> Done: $OUT"
+          EOF_6
+      - name: Build SVT-AV1 4.3.0 + FFmpeg for Android
+        run: bash scripts/build_native.sh
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.7" }
+      - name: Build debug APK
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SvtAv1Compressor-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
