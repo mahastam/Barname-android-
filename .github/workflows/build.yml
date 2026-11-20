@@ -108,7 +108,7 @@ jobs:
               private lateinit var cancelBtn: Button
 
               private val presets = (4..13).map { it.toString() }
-              private val resolutions = listOf("Original" to 0, "1080p" to 1080, "720p" to 720, "480p" to 480)
+              private val resolutions = listOf("Original" to 0, "720×1280" to 720, "1080×1920" to 1080)
 
               private val picker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
                   if (uri != null) loadInput(uri)
@@ -156,7 +156,7 @@ jobs:
                   status = TextView(this).apply { gravity = Gravity.START }
 
                   listOf(pickBtn, info, label("Speed preset (4 slow/better … 13 fast)"), presetSp,
-                      label("Resolution"), resSp, label(""), crfLabel, crfSeek, startBtn, cancelBtn, bar, status)
+                      label("Resolution (landscape videos use 1280×720 / 1920×1080)"), resSp, label(""), crfLabel, crfSeek, startBtn, cancelBtn, bar, status)
                       .forEach { root.addView(it) }
                   setContentView(ScrollView(this).apply { addView(root) })
               }
@@ -190,6 +190,17 @@ jobs:
                   } catch (e: Exception) { 0L } finally { r.release() }
               }
 
+              private fun videoSize(f: File): Pair<Int, Int> {
+                  val r = MediaMetadataRetriever()
+                  return try {
+                      r.setDataSource(f.absolutePath)
+                      val w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 0
+                      val h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 0
+                      val rot = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toInt() ?: 0
+                      if (rot == 90 || rot == 270) Pair(h, w) else Pair(w, h)
+                  } catch (e: Exception) { Pair(0, 0) } finally { r.release() }
+              }
+
               private fun startEncode() {
                   val input = inputFile ?: return
                   val ffmpeg = File(applicationInfo.nativeLibraryDir, "libffmpeg.so")
@@ -200,7 +211,7 @@ jobs:
                   val out = File(cacheDir, "output.mp4").also { it.delete() }
                   val preset = presets[presetSp.selectedItemPosition]
                   val crf = crfSeek.progress + 20
-                  val height = resolutions[resSp.selectedItemPosition].second
+                  val shortSide = resolutions[resSp.selectedItemPosition].second
                   val total = durationMs(input)
 
                   val cmd = mutableListOf(
@@ -211,8 +222,15 @@ jobs:
                       "-pix_fmt", "yuv420p", "-g", "240",
                       "-svtav1-params", "tune=0"
                   )
-                  if (height > 0) cmd += listOf("-vf", "scale=-2:'min($height,ih)'")
-                  cmd += listOf("-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out.absolutePath)
+                  if (shortSide > 0) {
+                      val longSide = if (shortSide == 720) 1280 else 1920
+                      val (vw, vh) = videoSize(input)
+                      val portrait = vh >= vw
+                      val w = if (portrait) shortSide else longSide
+                      val h = if (portrait) longSide else shortSide
+                      cmd += listOf("-vf", "scale=$w:$h:force_original_aspect_ratio=decrease:force_divisible_by=2")
+                  }
+                  cmd += listOf("-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", out.absolutePath)
 
                   startBtn.isEnabled = false; pickBtn.isEnabled = false
                   cancelBtn.visibility = View.VISIBLE
