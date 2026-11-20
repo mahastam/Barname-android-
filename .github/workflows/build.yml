@@ -294,6 +294,8 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$PREFIX"
           cmake --build svt-build -j"$(nproc)"
           cmake --install svt-build
+          # Android has no separate libpthread/librt; drop them from the pkg-config file
+          sed -i 's/-lpthread//g; s/-lrt//g' "$PREFIX"/lib/pkgconfig/SvtAv1Enc.pc
 
           echo "==> FFmpeg ($FFMPEG_REF)"
           [ -d FFmpeg ] || git clone --depth 1 --branch "$FFMPEG_REF" https://github.com/FFmpeg/FFmpeg.git
@@ -311,7 +313,7 @@ jobs:
             --enable-libsvtav1 \
             --disable-shared --enable-static --enable-pic \
             --disable-doc --disable-ffplay --disable-ffprobe --disable-debug \
-            --extra-cflags="-O3" --extra-ldflags="-static-libstdc++"
+            --extra-cflags="-O3"
           make -j"$(nproc)"
 
           OUT="$ROOT/app/src/main/jniLibs/arm64-v8a/libffmpeg.so"
@@ -321,9 +323,11 @@ jobs:
           echo "==> Done: $OUT"
           EOF_6
       - name: Build SVT-AV1 4.3.0 + FFmpeg for Android
-        run: bash scripts/build_native.sh
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}}"
+          echo "NDK: $ANDROID_NDK_HOME"
+          ls "$ANDROID_NDK_HOME" | head -3
+          bash scripts/build_native.sh
       - uses: gradle/actions/setup-gradle@v4
         with: { gradle-version: "8.7" }
       - name: Build debug APK
