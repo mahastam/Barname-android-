@@ -103,6 +103,8 @@ jobs:
               private lateinit var resSp: Spinner
               private lateinit var crfSeek: SeekBar
               private lateinit var crfLabel: TextView
+              private lateinit var audioSeek: SeekBar
+              private lateinit var audioLabel: TextView
               private lateinit var pickBtn: Button
               private lateinit var startBtn: Button
               private lateinit var cancelBtn: Button
@@ -150,13 +152,25 @@ jobs:
                   }
                   crfLabel.text = "Quality (CRF): 35  (higher = smaller file)"
 
+                  // HE-AAC v2 default 24 kbps (ideal balance for HE-AAC v2), adjustable 12..48
+                  audioLabel = TextView(this).apply { text = "Audio HE-AAC v2: 24 kbps" }
+                  audioSeek = SeekBar(this).apply {
+                      max = 48 - 12
+                      progress = 24 - 12
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { audioLabel.text = "Audio HE-AAC v2: ${p + 12} kbps" }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {}
+                      })
+                  }
+
                   startBtn = Button(this).apply { text = "Compress (SVT-AV1)"; isEnabled = false; setOnClickListener { startEncode() } }
                   cancelBtn = Button(this).apply { text = "Cancel"; visibility = View.GONE; setOnClickListener { process?.destroy() } }
                   bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
                   status = TextView(this).apply { gravity = Gravity.START }
 
                   listOf(pickBtn, info, label("Speed preset (4 slow/better … 13 fast)"), presetSp,
-                      label("Resolution (landscape videos use 1280×720 / 1920×1080)"), resSp, label(""), crfLabel, crfSeek, startBtn, cancelBtn, bar, status)
+                      label("Resolution (landscape videos use 1280×720 / 1920×1080)"), resSp, label(""), crfLabel, crfSeek, label(""), audioLabel, audioSeek, startBtn, cancelBtn, bar, status)
                       .forEach { root.addView(it) }
                   setContentView(ScrollView(this).apply { addView(root) })
               }
@@ -211,6 +225,7 @@ jobs:
                   val out = File(cacheDir, "output.mp4").also { it.delete() }
                   val preset = presets[presetSp.selectedItemPosition]
                   val crf = crfSeek.progress + 20
+                  val audioKbps = audioSeek.progress + 12
                   val shortSide = resolutions[resSp.selectedItemPosition].second
                   val total = durationMs(input)
 
@@ -230,7 +245,19 @@ jobs:
                       val h = if (portrait) longSide else shortSide
                       cmd += listOf("-vf", "scale=$w:$h:force_original_aspect_ratio=decrease:force_divisible_by=2")
                   }
-                  cmd += listOf("-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", out.absolutePath)
+                  // HE-AAC v2 with quality tuning for low-bitrate transparency
+                  cmd += listOf(
+                      "-c:a", "libfdk_aac",
+                      "-profile:a", "aac_he_v2",
+                      "-b:a", "${audioKbps}k",
+                      "-ac", "2",
+                      "-ar", "48000",
+                      "-aac_coder", "twoloop",
+                      "-aac_pns", "1",
+                      "-aac_tns", "1",
+                      "-movflags", "+faststart",
+                      out.absolutePath
+                  )
 
                   startBtn.isEnabled = false; pickBtn.isEnabled = false
                   cancelBtn.visibility = View.VISIBLE
@@ -315,6 +342,17 @@ jobs:
           # Android has no separate libpthread/librt; drop them from the pkg-config file
           sed -i 's/-lpthread//g; s/-lrt//g' "$PREFIX"/lib/pkgconfig/SvtAv1Enc.pc
 
+          echo "==> fdk-aac (HE-AAC v2 encoder)"
+          [ -d fdk-aac ] || git clone --depth 1 --branch v2.0.3 https://github.com/mstorsjo/fdk-aac.git
+          cmake -S fdk-aac -B fdk-build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM="android-$API" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=OFF -DBUILD_PROGRAMS=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX"
+          cmake --build fdk-build -j"$(nproc)"
+          cmake --install fdk-build
+
           echo "==> FFmpeg ($FFMPEG_REF)"
           [ -d FFmpeg ] || git clone --depth 1 --branch "$FFMPEG_REF" https://github.com/FFmpeg/FFmpeg.git
           cd FFmpeg
@@ -328,10 +366,11 @@ jobs:
             --ar="$TC/bin/llvm-ar" --nm="$TC/bin/llvm-nm" \
             --ranlib="$TC/bin/llvm-ranlib" --strip="$TC/bin/llvm-strip" \
             --pkg-config=pkg-config --pkg-config-flags=--static \
-            --enable-libsvtav1 \
+            --enable-libsvtav1 --enable-libfdk-aac --enable-nonfree \
+            --ld="$TC/bin/aarch64-linux-android${API}-clang++" \
             --disable-shared --enable-static --enable-pic \
             --disable-doc --disable-ffplay --disable-ffprobe --disable-debug \
-            --extra-cflags="-O3"
+            --extra-cflags="-O3" --extra-ldflags="-static-libstdc++"
           make -j"$(nproc)"
 
           OUT="$ROOT/app/src/main/jniLibs/arm64-v8a/libffmpeg.so"
